@@ -293,12 +293,29 @@ def create_app():
             }), 400
 
         id_carnet = str(data.get("ID_Carnet", "")).strip()
-        isbn = str(data.get("ISBN", "")).strip()
-
-        if not id_carnet or not isbn:
+        
+        # Soportar 'isbns' (arreglo) y también compatibilidad hacia atrás si llega un solo 'ISBN'
+        raw_isbns = data.get("isbns")
+        if raw_isbns is None and data.get("ISBN"):
+            raw_isbns = [data.get("ISBN")]
+            
+        if not isinstance(raw_isbns, list):
             return jsonify({
                 "success": False,
-                "error": "Los campos 'ID_Carnet' e 'ISBN' son obligatorios."
+                "error": "El campo 'isbns' debe ser un arreglo de identificadores ISBN."
+            }), 400
+
+        # Limpiar lista de ISBNs y remover vacíos/duplicados preservando orden
+        isbns = []
+        for x in raw_isbns:
+            cleaned = str(x).strip()
+            if cleaned and cleaned not in isbns:
+                isbns.append(cleaned)
+
+        if not id_carnet or len(isbns) == 0:
+            return jsonify({
+                "success": False,
+                "error": "Los campos 'ID_Carnet' e 'isbns' (al menos un ISBN) son obligatorios."
             }), 400
 
         # Validación de negocio: ID_Carnet debe ser numérico y tener exactamente 8 dígitos
@@ -313,7 +330,7 @@ def create_app():
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # 1. Verificar existencia y estado del estudiante
+            # 1. Verificar existencia y estado del estudiante (no debe estar 'Bloqueado')
             cursor.execute("SELECT ID_Carnet, Nombre, Estado_Cuenta FROM Estudiantes WHERE ID_Carnet = ?;", (id_carnet,))
             estudiante = cursor.fetchone()
             if not estudiante:
@@ -323,46 +340,49 @@ def create_app():
                 }), 404
 
             estado_cuenta = estudiante["Estado_Cuenta"]
-            if estado_cuenta != "Activo":
+            if estado_cuenta == "Bloqueado" or estado_cuenta != "Activo":
                 return jsonify({
                     "success": False,
                     "error": f"Préstamo denegado: el estudiante '{id_carnet}' se encuentra en estado '{estado_cuenta}'."
                 }), 403
 
-            # 2. Verificar límite de préstamos activos (máximo 5 activos)
+            # 2. Verificar límite de préstamos activos (máximo 5 libros en total)
             cursor.execute("""
                 SELECT COUNT(*) FROM Prestamos 
                 WHERE ID_Carnet = ? AND Estado_Prestamo = 'Activo';
             """, (id_carnet,))
             prestamos_activos_count = cursor.fetchone()[0]
 
-            if prestamos_activos_count >= 5:
+            if prestamos_activos_count + len(isbns) > 5:
                 return jsonify({
                     "success": False,
-                    "error": f"Préstamo denegado: el estudiante ya alcanzó el límite máximo de préstamos activos permitidos ({prestamos_activos_count}/5)."
-                }), 403
+                    "error": "Límite excedido. El estudiante solo puede tener un máximo de 5 libros prestados en total"
+                }), 400
 
-            # 3. Verificar existencia y estado del libro
-            cursor.execute("SELECT ISBN, Titulo, Estado FROM Libros WHERE ISBN = ?;", (isbn,))
-            libro = cursor.fetchone()
-            if not libro:
-                return jsonify({
-                    "success": False,
-                    "error": f"El libro con ISBN '{isbn}' no existe en el catálogo."
-                }), 404
+            # 3. Verificar que todos los libros existan y estén en estado 'Disponible'
+            libros_info = []
+            for item_isbn in isbns:
+                cursor.execute("SELECT ISBN, Titulo, Estado FROM Libros WHERE ISBN = ?;", (item_isbn,))
+                libro = cursor.fetchone()
+                if not libro:
+                    return jsonify({
+                        "success": False,
+                        "error": f"El libro con ISBN '{item_isbn}' no existe en el catálogo."
+                    }), 404
 
-            if libro["Estado"] != "Disponible":
-                return jsonify({
-                    "success": False,
-                    "error": f"Préstamo denegado: el libro '{libro['Titulo']}' no está disponible (Estado actual: '{libro['Estado']}')."
-                }), 409
+                if libro["Estado"] != "Disponible":
+                    return jsonify({
+                        "success": False,
+                        "error": f"Préstamo denegado: el libro '{libro['Titulo']}' no está disponible (Estado actual: '{libro['Estado']}')."
+                    }), 409
+                libros_info.append(libro)
 
-            # 4. Fechas y registro en transacción atómica
+            # 4. Fechas y registro en transacción atómica (Batch Processing)
             now = datetime.now()
             fecha_prestamo = now.strftime("%Y-%m-%d %H:%M:%S")
 
-            # Aceptar Fecha_Devolucion / Fecha_Limite_Devolucion enviada por el frontend
-            fecha_custom = data.get("Fecha_Devolucion") or data.get("Fecha_Limite_Devolucion")
+            # Aceptar fecha_devolucion / Fecha_Devolucion / Fecha_Limite_Devolucion
+            fecha_custom = data.get("fecha_devolucion") or data.get("Fecha_Devolucion") or data.get("Fecha_Limite_Devolucion")
             if fecha_custom:
                 fecha_limite = str(fecha_custom).strip()
                 if len(fecha_limite) == 10:  # formato YYYY-MM-DD
@@ -370,29 +390,37 @@ def create_app():
             else:
                 fecha_limite = (now + timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
 
-            cursor.execute("""
-                INSERT INTO Prestamos (ID_Carnet, ISBN, Fecha_Prestamo, Fecha_Limite_Devolucion, Estado_Prestamo)
-                VALUES (?, ?, ?, ?, 'Activo');
-            """, (id_carnet, isbn, fecha_prestamo, fecha_limite))
-            id_prestamo = cursor.lastrowid
+            # Procesamiento por lotes: bucle para insertar en Prestamos y actualizar Libros
+            prestamos_creados = []
+            for libro in libros_info:
+                cursor.execute("""
+                    INSERT INTO Prestamos (ID_Carnet, ISBN, Fecha_Prestamo, Fecha_Limite_Devolucion, Estado_Prestamo)
+                    VALUES (?, ?, ?, ?, 'Activo');
+                """, (id_carnet, libro["ISBN"], fecha_prestamo, fecha_limite))
+                id_prestamo = cursor.lastrowid
 
-            cursor.execute("""
-                UPDATE Libros 
-                SET Estado = 'Prestado' 
-                WHERE ISBN = ?;
-            """, (isbn,))
+                cursor.execute("""
+                    UPDATE Libros 
+                    SET Estado = 'Prestado' 
+                    WHERE ISBN = ?;
+                """, (libro["ISBN"],))
+
+                prestamos_creados.append({
+                    "ID_Prestamo": id_prestamo,
+                    "ISBN": libro["ISBN"],
+                    "Titulo": libro["Titulo"]
+                })
 
             conn.commit()
 
             return jsonify({
                 "success": True,
-                "message": "Préstamo registrado exitosamente.",
+                "message": f"Préstamo de {len(prestamos_creados)} libro(s) registrado exitosamente.",
                 "data": {
-                    "ID_Prestamo": id_prestamo,
                     "ID_Carnet": id_carnet,
                     "Estudiante": estudiante["Nombre"],
-                    "ISBN": isbn,
-                    "Libro": libro["Titulo"],
+                    "Libros_Prestados": prestamos_creados,
+                    "Total_Libros": len(prestamos_creados),
                     "Fecha_Prestamo": fecha_prestamo,
                     "Fecha_Limite_Devolucion": fecha_limite,
                     "Estado_Prestamo": "Activo"
@@ -404,7 +432,7 @@ def create_app():
                 conn.rollback()
             return jsonify({
                 "success": False,
-                "error": f"Error al procesar el préstamo: {str(e)}"
+                "error": f"Error al procesar el préstamo múltiple: {str(e)}"
             }), 500
         finally:
             if conn:
@@ -568,6 +596,218 @@ def create_app():
             return jsonify({
                 "success": False,
                 "error": f"Error al procesar la devolución: {str(e)}"
+            }), 500
+        finally:
+            if conn:
+                conn.close()
+
+    @app.route("/api/estudiantes/<id_carnet>", methods=["DELETE"])
+    def eliminar_estudiante(id_carnet):
+        """
+        Permite borrar registros de estudiantes.
+        Antes de hacer el DELETE en la tabla Estudiantes, consulta la tabla Prestamos.
+        Si el estudiante tiene libros con Estado_Prestamo = 'Activo', cancela la operación
+        y devuelve un error HTTP 400 ('No se puede eliminar al estudiante porque tiene libros pendientes').
+        Si no tiene préstamos activos, procede a eliminarlo.
+        """
+        carnet_clean = str(id_carnet).strip()
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            # Verificar existencia del estudiante
+            cursor.execute("SELECT ID_Carnet, Nombre FROM Estudiantes WHERE ID_Carnet = ?;", (carnet_clean,))
+            est = cursor.fetchone()
+            if not est:
+                return jsonify({
+                    "success": False,
+                    "error": f"No se encontró el estudiante con carnet '{carnet_clean}'."
+                }), 404
+
+            # Consultar préstamos con Estado_Prestamo = 'Activo'
+            cursor.execute("""
+                SELECT COUNT(*) FROM Prestamos 
+                WHERE ID_Carnet = ? AND Estado_Prestamo = 'Activo';
+            """, (carnet_clean,))
+            prestamos_activos = cursor.fetchone()[0]
+
+            if prestamos_activos > 0:
+                return jsonify({
+                    "success": False,
+                    "error": "No se puede eliminar al estudiante porque tiene libros pendientes"
+                }), 400
+
+            # Eliminar historial de préstamos devueltos/cerrados si existen para integridad referencial
+            cursor.execute("DELETE FROM Prestamos WHERE ID_Carnet = ?;", (carnet_clean,))
+
+            # Eliminar estudiante
+            cursor.execute("DELETE FROM Estudiantes WHERE ID_Carnet = ?;", (carnet_clean,))
+            conn.commit()
+
+            return jsonify({
+                "success": True,
+                "message": f"Estudiante '{est['Nombre']}' eliminado exitosamente."
+            }), 200
+
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            return jsonify({
+                "success": False,
+                "error": f"Error al eliminar estudiante: {str(e)}"
+            }), 500
+        finally:
+            if conn:
+                conn.close()
+
+    @app.route("/api/usuarios/gestor", methods=["POST"])
+    def crear_gestor():
+        """
+        Permite al 'Admin_Absoluto' crear nuevos perfiles tipo 'Gestor'.
+        Recibe ID_Usuario y Password, y los inserta en Usuarios_Sistema asignando forzosamente el Rol = 'Gestor'.
+        """
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({
+                "success": False,
+                "error": "El cuerpo de la solicitud debe ser un JSON válido."
+            }), 400
+
+        id_usuario = str(data.get("ID_Usuario", "")).strip()
+        password = str(data.get("Password", "")).strip()
+
+        if not id_usuario or not password:
+            return jsonify({
+                "success": False,
+                "error": "Los campos 'ID_Usuario' y 'Password' son obligatorios."
+            }), 400
+
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            # Verificar si ya existe el ID_Usuario
+            cursor.execute("SELECT ID_Usuario FROM Usuarios_Sistema WHERE ID_Usuario = ?;", (id_usuario,))
+            if cursor.fetchone():
+                return jsonify({
+                    "success": False,
+                    "error": f"El usuario '{id_usuario}' ya se encuentra registrado."
+                }), 400
+
+            # Forzar Rol = 'Gestor'
+            cursor.execute("""
+                INSERT INTO Usuarios_Sistema (ID_Usuario, Password, Rol)
+                VALUES (?, ?, 'Gestor');
+            """, (id_usuario, password))
+            conn.commit()
+
+            return jsonify({
+                "success": True,
+                "message": f"Gestor '{id_usuario}' creado exitosamente.",
+                "data": {
+                    "ID_Usuario": id_usuario,
+                    "Rol": "Gestor"
+                }
+            }), 201
+
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            return jsonify({
+                "success": False,
+                "error": f"Error al registrar gestor: {str(e)}"
+            }), 500
+        finally:
+            if conn:
+                conn.close()
+
+    @app.route("/api/usuarios/<id_usuario>", methods=["DELETE"])
+    def eliminar_usuario(id_usuario):
+        """
+        Permite al 'Admin_Absoluto' eliminar a un 'Gestor'.
+        Verifica que el usuario a eliminar NO sea el propio 'Admin_Absoluto'
+        (para no dejar el sistema sin admin principal). Si intenta borrarse a sí mismo, devuelve error 400.
+        """
+        target_usuario = str(id_usuario).strip()
+
+        # Validación inmediata: impedir eliminar al usuario principal 'admin'
+        if target_usuario.lower() == "admin":
+            return jsonify({
+                "success": False,
+                "error": "No se puede eliminar la cuenta de Admin Absoluto del sistema"
+            }), 400
+
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            # Verificar existencia y rol del usuario objetivo
+            cursor.execute("SELECT ID_Usuario, Rol FROM Usuarios_Sistema WHERE ID_Usuario = ?;", (target_usuario,))
+            user = cursor.fetchone()
+
+            if not user:
+                return jsonify({
+                    "success": False,
+                    "error": f"No se encontró el usuario '{target_usuario}'."
+                }), 404
+
+            # Si el usuario tiene el rol 'Admin_Absoluto', abortar inmediatamente
+            if user["Rol"] == "Admin_Absoluto":
+                return jsonify({
+                    "success": False,
+                    "error": "No se puede eliminar la cuenta de Admin Absoluto del sistema"
+                }), 400
+
+            # Solo permitir ejecutar la sentencia DELETE si el rol es estrictamente 'Gestor'
+            if user["Rol"] != "Gestor":
+                return jsonify({
+                    "success": False,
+                    "error": "Operación denegada: solo se pueden eliminar usuarios con rol 'Gestor'."
+                }), 403
+
+            # Proceder a eliminar al Gestor
+            cursor.execute("DELETE FROM Usuarios_Sistema WHERE ID_Usuario = ?;", (target_usuario,))
+            conn.commit()
+
+            return jsonify({
+                "success": True,
+                "message": f"Usuario Gestor '{target_usuario}' eliminado exitosamente."
+            }), 200
+
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            return jsonify({
+                "success": False,
+                "error": f"Error al eliminar usuario: {str(e)}"
+            }), 500
+        finally:
+            if conn:
+                conn.close()
+
+    @app.route("/api/usuarios", methods=["GET"])
+    def get_usuarios():
+        """
+        Devuelve la lista de usuarios del sistema (ID_Usuario y Rol) para la vista de gestión.
+        """
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT ID_Usuario, Rol FROM Usuarios_Sistema ORDER BY ID_Usuario ASC;")
+            usuarios = [dict(row) for row in cursor.fetchall()]
+            return jsonify({
+                "success": True,
+                "usuarios": usuarios,
+                "total": len(usuarios)
+            }), 200
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": f"Error al obtener usuarios: {str(e)}"
             }), 500
         finally:
             if conn:
