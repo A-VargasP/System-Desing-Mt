@@ -10,6 +10,57 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from database import init_db, get_db_connection
 
+def sincronizar_estados_estudiantes(cursor):
+    """
+    Evalúa dinámicamente los libros vencidos:
+    1. Obtiene la fecha actual usando datetime.now().date().
+    2. Identifica a todos los estudiantes con al menos un préstamo en Prestamos con Estado_Prestamo = 'Activo'
+       cuya Fecha_Limite_Devolucion sea menor a la fecha actual (< fecha_actual).
+    3. Para esos estudiantes, ejecuta automáticamente:
+       UPDATE Estudiantes SET Estado_Cuenta = 'Bloqueado' WHERE ID_Carnet IN (...);
+    4. Para los estudiantes que NO tengan ningún libro vencido pendiente,
+       asegura que su estado permanezca o se actualice a 'Activo'.
+    """
+    today_date = datetime.now().date()
+    today_str = today_date.strftime("%Y-%m-%d")
+
+    # Estudiantes con préstamos activos cuya fecha límite es anterior a hoy
+    # Usamos date(Fecha_Limite_Devolucion) < ? y substr(Fecha_Limite_Devolucion, 1, 10) < ? para compatibilidad absoluta
+    cursor.execute("""
+        SELECT DISTINCT ID_Carnet 
+        FROM Prestamos 
+        WHERE Estado_Prestamo = 'Activo' 
+          AND (
+              date(Fecha_Limite_Devolucion) < date(?)
+              OR substr(Fecha_Limite_Devolucion, 1, 10) < ?
+          );
+    """, (today_str, today_str))
+    bloqueados_rows = cursor.fetchall()
+    carnets_a_bloquear = [row["ID_Carnet"] for row in bloqueados_rows]
+
+    if carnets_a_bloquear:
+        placeholders = ",".join(["?"] * len(carnets_a_bloquear))
+        cursor.execute(f"""
+            UPDATE Estudiantes 
+            SET Estado_Cuenta = 'Bloqueado' 
+            WHERE ID_Carnet IN ({placeholders});
+        """, carnets_a_bloquear)
+
+        # Desbloquear a los demás estudiantes que no estén en la lista de bloqueados
+        cursor.execute(f"""
+            UPDATE Estudiantes 
+            SET Estado_Cuenta = 'Activo' 
+            WHERE Estado_Cuenta = 'Bloqueado' 
+              AND ID_Carnet NOT IN ({placeholders});
+        """, carnets_a_bloquear)
+    else:
+        # Si nadie tiene libros vencidos, todos los estudiantes bloqueados regresan a 'Activo'
+        cursor.execute("""
+            UPDATE Estudiantes 
+            SET Estado_Cuenta = 'Activo' 
+            WHERE Estado_Cuenta = 'Bloqueado';
+        """)
+
 def create_app():
     app = Flask(__name__)
     CORS(app)
@@ -218,6 +269,10 @@ def create_app():
             conn = get_db_connection()
             cursor = conn.cursor()
 
+            # Evaluación dinámica de libros vencidos antes de retornar respuesta
+            sincronizar_estados_estudiantes(cursor)
+            conn.commit()
+
             # 1. Obtener datos básicos del estudiante
             cursor.execute("""
                 SELECT ID_Carnet, Nombre, Telefono, Estado_Cuenta 
@@ -330,7 +385,36 @@ def create_app():
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # 1. Verificar existencia y estado del estudiante (no debe estar 'Bloqueado')
+            # 1. Recalcular condición de libros vencidos usando la fecha del día (datetime.now().date())
+            today_date = datetime.now().date()
+            today_str = today_date.strftime("%Y-%m-%d")
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM Prestamos
+                WHERE ID_Carnet = ? 
+                  AND Estado_Prestamo = 'Activo'
+                  AND (
+                      date(Fecha_Limite_Devolucion) < date(?)
+                      OR substr(Fecha_Limite_Devolucion, 1, 10) < ?
+                  );
+            """, (id_carnet, today_str, today_str))
+            libros_vencidos_count = cursor.fetchone()[0]
+
+            if libros_vencidos_count > 0:
+                # Actualizar estado a 'Bloqueado' inmediatamente
+                cursor.execute("""
+                    UPDATE Estudiantes 
+                    SET Estado_Cuenta = 'Bloqueado' 
+                    WHERE ID_Carnet = ?;
+                """, (id_carnet,))
+                conn.commit()
+
+                return jsonify({
+                    "success": False,
+                    "error": "El estudiante se encuentra penalizado por libros vencidos"
+                }), 400
+
+            # Verificar existencia y estado del estudiante en la base de datos
             cursor.execute("SELECT ID_Carnet, Nombre, Estado_Cuenta FROM Estudiantes WHERE ID_Carnet = ?;", (id_carnet,))
             estudiante = cursor.fetchone()
             if not estudiante:
@@ -343,8 +427,8 @@ def create_app():
             if estado_cuenta == "Bloqueado" or estado_cuenta != "Activo":
                 return jsonify({
                     "success": False,
-                    "error": f"Préstamo denegado: el estudiante '{id_carnet}' se encuentra en estado '{estado_cuenta}'."
-                }), 403
+                    "error": "El estudiante se encuentra penalizado por libros vencidos" if estado_cuenta == "Bloqueado" else f"Préstamo denegado: el estudiante '{id_carnet}' se encuentra en estado '{estado_cuenta}'."
+                }), 400 if estado_cuenta == "Bloqueado" else 403
 
             # 2. Verificar límite de préstamos activos (máximo 5 libros en total)
             cursor.execute("""
@@ -483,6 +567,7 @@ def create_app():
                 "success": False,
                 "error": f"Error al obtener préstamos activos: {str(e)}"
             }), 500
+    @app.route("/api/estudiantes", methods=["GET"])
     @app.route("/api/estudiantes/todos", methods=["GET"])
     def get_todos_estudiantes():
         """Devuelve la lista de todos los estudiantes registrados ordenados por Nombre."""
@@ -490,6 +575,11 @@ def create_app():
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
+
+            # Evaluación dinámica de libros vencidos antes de retornar la lista
+            sincronizar_estados_estudiantes(cursor)
+            conn.commit()
+
             cursor.execute("""
                 SELECT ID_Carnet, Nombre, Telefono, Estado_Cuenta 
                 FROM Estudiantes 
@@ -563,6 +653,8 @@ def create_app():
             target_prestamo_id = prestamo["ID_Prestamo"]
             target_isbn = prestamo["ISBN"]
 
+            target_carnet = prestamo["ID_Carnet"]
+
             # Actualizar Préstamo a Devuelto
             cursor.execute("""
                 UPDATE Prestamos 
@@ -577,6 +669,25 @@ def create_app():
                 WHERE ISBN = ?;
             """, (target_isbn,))
 
+            # Regla de Desbloqueo Automático:
+            # Verificar si el estudiante aún tiene otros préstamos activos cuya Fecha_Limite_Devolucion sea anterior a la fecha actual.
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("""
+                SELECT COUNT(*) FROM Prestamos
+                WHERE ID_Carnet = ? 
+                  AND Estado_Prestamo = 'Activo' 
+                  AND Fecha_Limite_Devolucion < ?;
+            """, (target_carnet, now_str))
+            prestamos_vencidos_count = cursor.fetchone()[0]
+
+            # Si el conteo es 0, restablecer Estado_Cuenta = 'Activo'
+            if prestamos_vencidos_count == 0:
+                cursor.execute("""
+                    UPDATE Estudiantes 
+                    SET Estado_Cuenta = 'Activo' 
+                    WHERE ID_Carnet = ?;
+                """, (target_carnet,))
+
             conn.commit()
 
             return jsonify({
@@ -585,6 +696,7 @@ def create_app():
                 "data": {
                     "ID_Prestamo": target_prestamo_id,
                     "ISBN": target_isbn,
+                    "ID_Carnet": target_carnet,
                     "Estado_Libro": "Disponible",
                     "Estado_Prestamo": "Devuelto"
                 }
