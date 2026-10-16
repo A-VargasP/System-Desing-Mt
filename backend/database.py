@@ -35,15 +35,22 @@ def init_db():
         );
     """)
 
-    # Tabla Libros
+    # Tabla Libros (con campo Categoria)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS Libros (
             ISBN TEXT PRIMARY KEY,
             Titulo TEXT NOT NULL,
             Autor TEXT NOT NULL,
+            Categoria TEXT NOT NULL DEFAULT 'Literatura Clásica',
             Estado TEXT NOT NULL DEFAULT 'Disponible' CHECK (Estado IN ('Disponible', 'Prestado', 'En Reparacion', 'Baja'))
         );
     """)
+
+    # Migración de esquema: Si la tabla ya existía sin Categoria, agregar la columna
+    cursor.execute("PRAGMA table_info(Libros);")
+    columnas_libros = [col["name"] for col in cursor.fetchall()]
+    if "Categoria" not in columnas_libros:
+        cursor.execute("ALTER TABLE Libros ADD COLUMN Categoria TEXT NOT NULL DEFAULT 'Literatura Clásica';")
 
     # Tabla Prestamos
     cursor.execute("""
@@ -65,23 +72,23 @@ def init_db():
         VALUES (?, ?, ?);
     """, ('admin', 'admin123', 'Admin_Absoluto'))
 
-    # Inserción de 10 libros clásicos de programación y literatura
+    # Inserción de 10 libros clásicos de programación y literatura con su Categoria
     libros_iniciales = [
-        ('978-0132350884', 'Clean Code: A Handbook of Agile Software Craftsmanship', 'Robert C. Martin', 'Disponible'),
-        ('978-0201616224', 'The Pragmatic Programmer: From Journeyman to Master', 'Andrew Hunt, David Thomas', 'Disponible'),
-        ('978-0262033848', 'Introduction to Algorithms (CLRS)', 'Thomas H. Cormen et al.', 'Disponible'),
-        ('978-0131103627', 'The C Programming Language', 'Brian W. Kernighan, Dennis M. Ritchie', 'Disponible'),
-        ('978-0596007126', 'Head First Design Patterns', 'Eric Freeman, Elisabeth Robson', 'Disponible'),
-        ('978-8420685626', 'Cien años de soledad', 'Gabriel García Márquez', 'Disponible'),
-        ('978-8424116286', 'Don Quijote de la Mancha', 'Miguel de Cervantes', 'Disponible'),
-        ('978-0451524935', '1984', 'George Orwell', 'Disponible'),
-        ('978-0141439518', 'Pride and Prejudice', 'Jane Austen', 'Disponible'),
-        ('978-0060883287', 'Fahrenheit 451', 'Ray Bradbury', 'Disponible')
+        ('978-0132350884', 'Clean Code: A Handbook of Agile Software Craftsmanship', 'Robert C. Martin', 'Programación', 'Disponible'),
+        ('978-0201616224', 'The Pragmatic Programmer: From Journeyman to Master', 'Andrew Hunt, David Thomas', 'Programación', 'Disponible'),
+        ('978-0262033848', 'Introduction to Algorithms (CLRS)', 'Thomas H. Cormen et al.', 'Programación', 'Disponible'),
+        ('978-0131103627', 'The C Programming Language', 'Brian W. Kernighan, Dennis M. Ritchie', 'Programación', 'Disponible'),
+        ('978-0596007126', 'Head First Design Patterns', 'Eric Freeman, Elisabeth Robson', 'Programación', 'Disponible'),
+        ('978-8420685626', 'Cien años de soledad', 'Gabriel García Márquez', 'Literatura Clásica', 'Disponible'),
+        ('978-8424116286', 'Don Quijote de la Mancha', 'Miguel de Cervantes', 'Literatura Clásica', 'Disponible'),
+        ('978-0451524935', '1984', 'George Orwell', 'Ciencia Ficción', 'Disponible'),
+        ('978-0141439518', 'Pride and Prejudice', 'Jane Austen', 'Literatura Clásica', 'Disponible'),
+        ('978-0060883287', 'Fahrenheit 451', 'Ray Bradbury', 'Ciencia Ficción', 'Disponible')
     ]
 
     cursor.executemany("""
-        INSERT OR IGNORE INTO Libros (ISBN, Titulo, Autor, Estado)
-        VALUES (?, ?, ?, ?);
+        INSERT OR IGNORE INTO Libros (ISBN, Titulo, Autor, Categoria, Estado)
+        VALUES (?, ?, ?, ?, ?);
     """, libros_iniciales)
 
     conn.commit()

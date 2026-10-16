@@ -3,25 +3,41 @@ import './App.css';
 
 const API_BASE_URL = 'http://localhost:5000/api';
 
-// Paleta de gradientes para los placeholders de portadas
-const COVER_GRADIENTS = [
-  'linear-gradient(135deg, #1e3a8a, #3b82f6)',
-  'linear-gradient(135deg, #065f46, #10b981)',
-  'linear-gradient(135deg, #7c2d12, #f97316)',
-  'linear-gradient(135deg, #581c87, #a855f7)',
-  'linear-gradient(135deg, #831843, #ec4899)',
-  'linear-gradient(135deg, #134e4a, #14b8a6)',
-  'linear-gradient(135deg, #374151, #6b7280)',
-  'linear-gradient(135deg, #14532d, #22c55e)'
-];
+// Componente para cargar portada desde Open Library con fallback elegante
+function BookCover({ isbn, titulo }) {
+  const [hasError, setHasError] = useState(false);
+  const [loaded, setLoaded] = useState(false);
 
-function getCoverStyle(isbn) {
-  let hash = 0;
-  for (let i = 0; i < isbn.length; i++) {
-    hash = isbn.charCodeAt(i) + ((hash << 5) - hash);
+  // Limpiar ISBN para la URL de Open Library
+  const cleanIsbn = isbn ? isbn.replace(/[^0-9X]/gi, '') : '';
+  const coverUrl = cleanIsbn ? `https://covers.openlibrary.org/b/isbn/${cleanIsbn}-M.jpg` : '';
+
+  if (!coverUrl || hasError) {
+    return (
+      <div className="book-cover-fallback">
+        <span className="fallback-icon">📖</span>
+        <span className="fallback-title">{titulo}</span>
+      </div>
+    );
   }
-  const index = Math.abs(hash) % COVER_GRADIENTS.length;
-  return { background: COVER_GRADIENTS[index] };
+
+  return (
+    <div className="book-cover-wrapper">
+      {!loaded && (
+        <div className="book-cover-loading">
+          <span className="fallback-title">{titulo}</span>
+        </div>
+      )}
+      <img
+        src={coverUrl}
+        alt={`Portada de ${titulo}`}
+        className={`book-cover-img ${loaded ? 'visible' : 'hidden'}`}
+        loading="lazy"
+        onLoad={() => setLoaded(true)}
+        onError={() => setHasError(true)}
+      />
+    </div>
+  );
 }
 
 // Formateador para input type="date" estándar HTML5 (YYYY-MM-DD)
@@ -104,6 +120,10 @@ export default function App() {
   const [libros, setLibros] = useState([]);
   const [loadingLibros, setLoadingLibros] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState('Todos');
+
+  // Categorías fijas requeridas
+  const CATEGORIAS = ['Todos', 'Programación', 'Literatura Clásica', 'Ciencia Ficción', 'Historia y Filosofía'];
 
   // Modal Alquiler / Carrito de Préstamos Múltiples (Batch Processing)
   const [librosSeleccionados, setLibrosSeleccionados] = useState([]); // Arreglo de libros seleccionados
@@ -149,11 +169,20 @@ export default function App() {
 
   const filteredLibros = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
-    if (!q) return libros;
-    return libros.filter(
-      (b) => b.Titulo.toLowerCase().includes(q) || b.Autor.toLowerCase().includes(q)
-    );
-  }, [libros, searchQuery]);
+    return libros.filter((b) => {
+      const matchSearch =
+        !q ||
+        b.Titulo.toLowerCase().includes(q) ||
+        b.Autor.toLowerCase().includes(q) ||
+        (b.ISBN && b.ISBN.toLowerCase().includes(q));
+
+      const matchCategory =
+        selectedCategory === 'Todos' ||
+        (b.Categoria && b.Categoria.trim().toLowerCase() === selectedCategory.trim().toLowerCase());
+
+      return matchSearch && matchCategory;
+    });
+  }, [libros, searchQuery, selectedCategory]);
 
   // Manejo de Selección / Deselección en el Carrito (Máximo 5 libros)
   const handleToggleSelectBook = (libro) => {
@@ -614,7 +643,7 @@ export default function App() {
                   <input
                     type="text"
                     className="search-input"
-                    placeholder="Buscar libros por título o autor en tiempo real..."
+                    placeholder="Buscar libros por título, autor o ISBN..."
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                   />
@@ -622,47 +651,79 @@ export default function App() {
                 <button className="btn-secondary" onClick={fetchLibros}>🔄 Actualizar</button>
               </div>
 
-              <div className="grid-container">
-                <div className="books-grid">
-                  {filteredLibros.map((libro) => {
-                    const isSelected = librosSeleccionados.some((b) => b.ISBN === libro.ISBN);
-                    const isAvailable = libro.Estado === 'Disponible';
+              {/* Barra de Categorías (Pills) */}
+              <div className="category-pills-bar">
+                {CATEGORIAS.map((cat) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    className={`category-pill ${selectedCategory === cat ? 'active' : ''}`}
+                    onClick={() => setSelectedCategory(cat)}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
 
-                    return (
-                      <div
-                        key={libro.ISBN}
-                        className={`book-card ${isAvailable ? 'available' : 'borrowed'} ${isSelected ? 'selected-cart' : ''}`}
-                        onClick={() => isAvailable && handleToggleSelectBook(libro)}
-                      >
-                        <div className="cover-placeholder" style={getCoverStyle(libro.ISBN)}>
-                          <span className="cover-placeholder-title">{libro.Titulo}</span>
-                          {isSelected && <span className="cart-badge-check">✓ En Carrito</span>}
+              <div className="grid-container">
+                {filteredLibros.length === 0 ? (
+                  <div className="empty-state" style={{ padding: '60px 20px' }}>
+                    <p style={{ fontSize: '1.2rem', marginBottom: '8px' }}>🔍 No se encontraron libros</p>
+                    <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                      Prueba con otro término de búsqueda o selecciona la categoría "Todos".
+                    </p>
+                  </div>
+                ) : (
+                  <div className="books-grid">
+                    {filteredLibros.map((libro) => {
+                      const isSelected = librosSeleccionados.some((b) => b.ISBN === libro.ISBN);
+                      const isAvailable = libro.Estado === 'Disponible';
+
+                      return (
+                        <div
+                          key={libro.ISBN}
+                          className={`book-card ${isAvailable ? 'available' : 'borrowed'} ${isSelected ? 'selected-cart' : ''}`}
+                          onClick={() => isAvailable && handleToggleSelectBook(libro)}
+                        >
+                          <div className="book-card-cover-container">
+                            <BookCover isbn={libro.ISBN} titulo={libro.Titulo} />
+                            {isSelected && <span className="cart-badge-check">✓ En Carrito</span>}
+                            {libro.Categoria && (
+                              <span className="book-category-tag">{libro.Categoria}</span>
+                            )}
+                          </div>
+
+                          <div className="book-info">
+                            <h4 className="book-title" title={libro.Titulo}>{libro.Titulo}</h4>
+                            <p className="book-author" title={libro.Autor}>{libro.Autor}</p>
+                            <p className="book-isbn">ISBN: {libro.ISBN}</p>
+                            
+                            <div className="book-card-footer">
+                              <span className={`badge ${isAvailable ? 'available' : 'borrowed'}`}>
+                                {isAvailable ? '● Disponible' : '● Prestado'}
+                              </span>
+                              <button
+                                type="button"
+                                className={`card-action-btn ${isSelected ? 'btn-selected' : ''}`}
+                                disabled={!isAvailable}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleToggleSelectBook(libro);
+                                }}
+                              >
+                                {!isAvailable
+                                  ? 'No disponible'
+                                  : isSelected
+                                  ? '✓ Deseleccionar'
+                                  : 'Seleccionar'}
+                              </button>
+                            </div>
+                          </div>
                         </div>
-                        <div className="book-info">
-                          <h4 className="book-title">{libro.Titulo}</h4>
-                          <p className="book-author">Por: {libro.Autor}</p>
-                          <p className="book-isbn">ISBN: {libro.ISBN}</p>
-                          <span className={`badge ${isAvailable ? 'available' : 'borrowed'}`}>{libro.Estado}</span>
-                          <button
-                            type="button"
-                            className={`card-action-btn ${isSelected ? 'btn-selected' : ''}`}
-                            disabled={!isAvailable}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleToggleSelectBook(libro);
-                            }}
-                          >
-                            {!isAvailable
-                              ? 'No disponible'
-                              : isSelected
-                              ? '✓ Deseleccionar'
-                              : 'Seleccionar'}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               {/* Barra inferior flotante tipo Carrito de Préstamos */}

@@ -47,7 +47,7 @@ def create_app():
             conn = get_db_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT ISBN, Titulo, Autor, Estado 
+                SELECT ISBN, Titulo, Autor, Categoria, Estado 
                 FROM Libros 
                 ORDER BY Titulo ASC;
             """)
