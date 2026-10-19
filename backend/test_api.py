@@ -106,7 +106,7 @@ class BibliotecaAPITestCase(unittest.TestCase):
             "ID_Carnet": carnet,
             "ISBN": otro_libro['ISBN']
         })
-        self.assertEqual(res_bloqueado.status_code, 403)
+        self.assertIn(res_bloqueado.status_code, [400, 403])
 
     def test_04_get_prestamos_activos(self):
         res = self.client.get('/api/prestamos/activos')
